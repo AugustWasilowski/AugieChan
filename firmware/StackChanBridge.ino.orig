@@ -1,0 +1,317 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <ArduinoJson.h>
+
+#include <M5StackChan.h>
+#include <Avatar.h>
+
+#include "secrets.h"
+
+using namespace m5avatar;
+
+static Avatar avatar;
+static WebServer server(HTTP_PORT);
+static String localIP;
+
+// speech-bubble auto-clear: tracked in loop(), no FreeRTOS task
+static volatile uint32_t s_speech_clear_at_ms = 0;
+static volatile bool     s_speaking = false;
+
+static const char* expressionName(Expression e) {
+  switch (e) {
+    case Expression::Happy:   return "happy";
+    case Expression::Angry:   return "angry";
+    case Expression::Sad:     return "sad";
+    case Expression::Doubt:   return "doubt";
+    case Expression::Sleepy:  return "sleepy";
+    case Expression::Neutral: return "neutral";
+  }
+  return "neutral";
+}
+
+static bool parseExpression(const String& name, Expression& out) {
+  if (name == "happy")   { out = Expression::Happy;   return true; }
+  if (name == "angry")   { out = Expression::Angry;   return true; }
+  if (name == "sad")     { out = Expression::Sad;     return true; }
+  if (name == "doubt")   { out = Expression::Doubt;   return true; }
+  if (name == "sleepy")  { out = Expression::Sleepy;  return true; }
+  if (name == "neutral") { out = Expression::Neutral; return true; }
+  return false;
+}
+
+// ---- helpers ---------------------------------------------------------------
+
+static void sendJson(int code, const JsonDocument& doc) {
+  String body;
+  serializeJson(doc, body);
+  server.send(code, "application/json", body);
+}
+
+static void sendErr(int code, const char* msg) {
+  JsonDocument d;
+  d["ok"] = false;
+  d["error"] = msg;
+  sendJson(code, d);
+}
+
+static bool readJsonBody(JsonDocument& out) {
+  if (!server.hasArg("plain")) return false;
+  return deserializeJson(out, server.arg("plain")) == DeserializationError::Ok;
+}
+
+// ---- HTTP routes -----------------------------------------------------------
+
+static void handleStatus() {
+  JsonDocument d;
+  d["ok"] = true;
+  d["device"] = "stackchan";
+  d["uptime_ms"] = (uint32_t)millis();
+  d["ip"] = localIP;
+  d["mac"] = WiFi.macAddress();
+  d["rssi"] = WiFi.RSSI();
+  d["battery_v"] = M5StackChan.getBatteryVoltage();
+  d["battery_a"] = M5StackChan.getBatteryCurrent();
+  d["expression"] = expressionName(avatar.getExpression());
+  d["yaw"] = M5StackChan.Motion.getCurrentYawAngle();
+  d["pitch"] = M5StackChan.Motion.getCurrentPitchAngle();
+  sendJson(200, d);
+}
+
+static void handleFace() {
+  JsonDocument body;
+  if (!readJsonBody(body)) { sendErr(400, "invalid json body"); return; }
+
+  if (body["expression"].is<const char*>()) {
+    Expression e;
+    if (parseExpression(body["expression"].as<String>(), e)) {
+      avatar.setExpression(e);
+    } else {
+      sendErr(400, "unknown expression");
+      return;
+    }
+  }
+  if (body["mouth"].is<float>())   avatar.setMouthOpenRatio(body["mouth"].as<float>());
+  if (body["eyes"].is<float>())    avatar.setEyeOpenRatio(body["eyes"].as<float>());
+  if (body["breath"].is<float>())  avatar.setBreath(body["breath"].as<float>());
+  if (body["gaze_v"].is<float>() || body["gaze_h"].is<float>()) {
+    float v = body["gaze_v"] | 0.0f;
+    float h = body["gaze_h"] | 0.0f;
+    avatar.setLeftGaze(v, h);
+    avatar.setRightGaze(v, h);
+  }
+
+  JsonDocument res;
+  res["ok"] = true;
+  res["expression"] = expressionName(avatar.getExpression());
+  sendJson(200, res);
+}
+
+static void handleSpeak() {
+  JsonDocument body;
+  if (!readJsonBody(body)) { sendErr(400, "invalid json body"); return; }
+  String text = body["text"] | "";
+  uint32_t hold_ms = body["hold_ms"] | 2500;
+
+  avatar.setSpeechText(text.c_str());
+  // crude lip-sync: open mouth, then clear from loop() once hold_ms has elapsed
+  avatar.setMouthOpenRatio(0.6f);
+  s_speech_clear_at_ms = millis() + hold_ms;
+  s_speaking = true;
+
+  JsonDocument res;
+  res["ok"] = true;
+  res["text"] = text;
+  res["hold_ms"] = hold_ms;
+  sendJson(200, res);
+}
+
+static void handleServo() {
+  JsonDocument body;
+  if (!readJsonBody(body)) { sendErr(400, "invalid json body"); return; }
+  int speed = body["speed"] | 500;
+  bool moved = false;
+
+  if (body["yaw"].is<int>() && body["pitch"].is<int>()) {
+    M5StackChan.Motion.move(body["yaw"].as<int>(), body["pitch"].as<int>(), speed);
+    moved = true;
+  } else if (body["yaw"].is<int>()) {
+    M5StackChan.Motion.moveYaw(body["yaw"].as<int>(), speed);
+    moved = true;
+  } else if (body["pitch"].is<int>()) {
+    M5StackChan.Motion.movePitch(body["pitch"].as<int>(), speed);
+    moved = true;
+  }
+  if (body["look_x"].is<float>() || body["look_y"].is<float>()) {
+    float x = body["look_x"] | 0.0f;
+    float y = body["look_y"] | 0.0f;
+    M5StackChan.Motion.lookAtNormalized(x, y, speed);
+    moved = true;
+  }
+  if (body["spin"].is<int>()) {
+    M5StackChan.Motion.rotateYaw(body["spin"].as<int>());
+    moved = true;
+  }
+
+  if (!moved) { sendErr(400, "need yaw/pitch/look_x/look_y/spin"); return; }
+  JsonDocument res; res["ok"] = true; sendJson(200, res);
+}
+
+static void handleHome() {
+  int speed = 500;
+  if (server.hasArg("plain")) {
+    JsonDocument body;
+    if (deserializeJson(body, server.arg("plain")) == DeserializationError::Ok) {
+      speed = body["speed"] | 500;
+    }
+  }
+  M5StackChan.Motion.goHome(speed);
+  JsonDocument res; res["ok"] = true; sendJson(200, res);
+}
+
+static void handleStopServo() {
+  M5StackChan.Motion.stop();
+  JsonDocument res; res["ok"] = true; sendJson(200, res);
+}
+
+static void handleLed() {
+  JsonDocument body;
+  if (!readJsonBody(body)) { sendErr(400, "invalid json body"); return; }
+  uint8_t r = body["r"] | 0;
+  uint8_t g = body["g"] | 0;
+  uint8_t b = body["b"] | 0;
+
+  if (body["index"].is<int>()) {
+    int idx = body["index"].as<int>();
+    if (idx < 0 || idx > 11) { sendErr(400, "index 0..11"); return; }
+    M5StackChan.setRgbColor(idx, r, g, b);
+    M5StackChan.refreshRgb();
+  } else {
+    M5StackChan.showRgbColor(r, g, b);
+  }
+  JsonDocument res; res["ok"] = true; sendJson(200, res);
+}
+
+static void handleNotFound() {
+  sendErr(404, "no such route");
+}
+
+// ---- outbound event poster ------------------------------------------------
+
+static void postEvent(const char* event, const JsonDocument& extra) {
+  if (WiFi.status() != WL_CONNECTED) return;
+  WiFiClientSecure secure;
+  secure.setInsecure();   // n8n cert is fine; skip verification for now
+  HTTPClient http;
+  if (!http.begin(secure, N8N_EVENT_URL)) return;
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(3000);
+
+  JsonDocument payload;
+  payload["device"] = "stackchan";
+  payload["mac"] = WiFi.macAddress();
+  payload["uptime_ms"] = (uint32_t)millis();
+  payload["event"] = event;
+  for (JsonPairConst kv : extra.as<JsonObjectConst>()) {
+    payload[kv.key()] = kv.value();
+  }
+  String body;
+  serializeJson(payload, body);
+  http.POST(body);
+  http.end();
+}
+
+// ---- setup / loop ---------------------------------------------------------
+
+static void connectWifi() {
+  M5StackChan.Display().setTextSize(2);
+  M5StackChan.Display().setTextColor(TFT_CYAN);
+  M5StackChan.Display().setCursor(0, 0);
+  M5StackChan.Display().printf("WiFi: %s\n", WIFI_SSID);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname(MDNS_HOSTNAME);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 30000) {
+    delay(250);
+    M5StackChan.Display().print(".");
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    M5StackChan.Display().setTextColor(TFT_RED);
+    M5StackChan.Display().printf("\nWiFi FAIL\n");
+    return;
+  }
+  localIP = WiFi.localIP().toString();
+  M5StackChan.Display().setTextColor(TFT_GREEN);
+  M5StackChan.Display().printf("\nIP: %s\n", localIP.c_str());
+
+  if (MDNS.begin(MDNS_HOSTNAME)) {
+    MDNS.addService("http", "tcp", HTTP_PORT);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  M5StackChan.begin();
+
+  connectWifi();
+  delay(1500);
+
+  // hand the screen over to Avatar
+  avatar.init();
+  avatar.setSpeechFont(&fonts::Font2);
+  if (!localIP.isEmpty()) {
+    String hello = String("hi! ") + localIP;
+    avatar.setSpeechText(hello.c_str());
+  }
+
+  server.on("/",            HTTP_GET,  handleStatus);
+  server.on("/status",      HTTP_GET,  handleStatus);
+  server.on("/face",        HTTP_POST, handleFace);
+  server.on("/speak",       HTTP_POST, handleSpeak);
+  server.on("/servo",       HTTP_POST, handleServo);
+  server.on("/servo/home",  HTTP_POST, handleHome);
+  server.on("/servo/stop",  HTTP_POST, handleStopServo);
+  server.on("/led",         HTTP_POST, handleLed);
+  server.onNotFound(handleNotFound);
+  server.begin();
+
+  Serial.printf("HTTP listening on http://%s:%d\n", localIP.c_str(), HTTP_PORT);
+}
+
+void loop() {
+  M5StackChan.update();
+  server.handleClient();
+
+  // expire pending speech bubble (overflow-safe via signed compare)
+  if (s_speaking && (int32_t)(millis() - s_speech_clear_at_ms) >= 0) {
+    avatar.setSpeechText("");
+    avatar.setMouthOpenRatio(0.0f);
+    s_speaking = false;
+  }
+
+  // touch sensor → n8n
+  auto& ts = M5StackChan.TouchSensor;
+  if (ts.wasClicked()) {
+    JsonDocument extra;
+    auto& intens = ts.getIntensities();
+    JsonArray arr = extra["intensities"].to<JsonArray>();
+    arr.add(intens[0]); arr.add(intens[1]); arr.add(intens[2]);
+    postEvent("touch_click", extra);
+  }
+  if (ts.wasSwipedForward()) {
+    JsonDocument extra;
+    postEvent("touch_swipe_forward", extra);
+  }
+  if (ts.wasSwipedBackward()) {
+    JsonDocument extra;
+    postEvent("touch_swipe_backward", extra);
+  }
+
+  delay(10);
+}

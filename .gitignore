@@ -1,0 +1,23 @@
+# Secrets — NEVER commit. Use the .example as a template.
+firmware/StackChanBridge/secrets.h
+**/secrets.h
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Arduino build artifacts
+build/
+*.bin
+*.elf
+*.hex
+*.map

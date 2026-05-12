@@ -1,0 +1,16 @@
+[Unit]
+Description=StackChan tracker control socket
+# The .service unit (same basename) will be activated on first connection.
+
+[Socket]
+ListenStream=5051
+# Accept=no means systemd hands the listening socket to the .service unit
+# rather than spawning one service per connection (inetd-style). The
+# service holds the socket until it exits, then it returns here.
+Accept=no
+# Don't restart the activation immediately if the service crashes — gives
+# tracker.py a chance to log and exit cleanly via the /track-off path.
+ReusePort=false
+
+[Install]
+WantedBy=sockets.target

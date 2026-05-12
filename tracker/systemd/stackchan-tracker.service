@@ -1,0 +1,22 @@
+[Unit]
+Description=StackChan face-following tracker (socket-activated)
+Requires=stackchan-tracker.socket
+After=stackchan-tracker.socket network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mayorawesome
+WorkingDirectory=/home/mayorawesome/stackchan-tracker
+Environment=STACKCHAN_BASE=http://10.0.0.134
+ExecStart=/home/mayorawesome/stackchan-tracker/.venv/bin/python /home/mayorawesome/stackchan-tracker/tracker.py
+# Don't auto-restart — the service is supposed to exit cleanly on /track off
+# so systemd can hibernate the unit. The .socket unit keeps listening and
+# will re-launch this service on the next inbound POST.
+Restart=no
+# stackchan-tracker.socket passes fd 3 via the LISTEN_FDS env var (Accept=no
+# means socket-activation passes file descriptors, not stdin). tracker.py
+# reads $LISTEN_FDS and grabs the inherited listening socket.
+
+[Install]
+WantedBy=multi-user.target
