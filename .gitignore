@@ -1,6 +1,12 @@
 # Secrets — NEVER commit. Use the .example as a template.
 firmware/StackChanBridge/secrets.h
 **/secrets.h
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
 
 # Python
 .venv/
