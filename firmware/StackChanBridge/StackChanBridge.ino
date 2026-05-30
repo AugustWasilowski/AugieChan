@@ -72,11 +72,11 @@ static uint8_t* s_play_buf = nullptr;
 static size_t   s_play_buf_len = 0;
 static const size_t PLAY_BUF_MAX = 4 * 1024 * 1024;   // 4 MB hard cap
 
-// WS2812 strip on Port C (blue, top). Pin 2 of Port C on CoreS3 = GPIO 17.
+// WS2812 strip on Port C (blue, top). Pin 1 of Port C on CoreS3 = GPIO 18.
 // Port A is unusable here because it shares I2C with the camera SCCB bus.
 // 30 LEDs at brightness 255 white draws ~1.8A; Port C's 5V can deliver maybe
 // 500mA before the CoreS3 browns out, so we hard-cap brightness at 64 (~25%).
-static const uint8_t  STRIP_PIN = 17;
+static const uint8_t  STRIP_PIN = 18;
 static const uint16_t STRIP_COUNT = 30;
 static const uint8_t  STRIP_MAX_BRIGHTNESS = 64;
 static Adafruit_NeoPixel strip(STRIP_COUNT, STRIP_PIN, NEO_GRB + NEO_KHZ800);
