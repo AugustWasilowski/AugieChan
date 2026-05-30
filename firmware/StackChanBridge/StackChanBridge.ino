@@ -9,6 +9,7 @@
 
 #include <M5StackChan.h>
 #include <Avatar.h>
+#include <Adafruit_NeoPixel.h>
 
 // Camera support: native ESP32 camera driver + ESP-IDF HTTP server.
 // We run a SECOND httpd on port 81 dedicated to camera streaming, so MJPEG
@@ -70,6 +71,22 @@ static volatile bool     s_speaking = false;
 static uint8_t* s_play_buf = nullptr;
 static size_t   s_play_buf_len = 0;
 static const size_t PLAY_BUF_MAX = 4 * 1024 * 1024;   // 4 MB hard cap
+
+// WS2812 strip on Port C (blue, top). Pin 2 of Port C on CoreS3 = GPIO 17.
+// Port A is unusable here because it shares I2C with the camera SCCB bus.
+// 30 LEDs at brightness 255 white draws ~1.8A; Port C's 5V can deliver maybe
+// 500mA before the CoreS3 browns out, so we hard-cap brightness at 64 (~25%).
+static const uint8_t  STRIP_PIN = 17;
+static const uint16_t STRIP_COUNT = 30;
+static const uint8_t  STRIP_MAX_BRIGHTNESS = 64;
+static Adafruit_NeoPixel strip(STRIP_COUNT, STRIP_PIN, NEO_GRB + NEO_KHZ800);
+
+enum StripMode : uint8_t { STRIP_MODE_STATIC, STRIP_MODE_RAINBOW, STRIP_MODE_BREATHE, STRIP_MODE_CHASE };
+static StripMode s_strip_mode = STRIP_MODE_STATIC;
+static uint32_t  s_strip_base_color = 0;                // packed RGB for breathe/chase
+static uint16_t  s_strip_phase = 0;                     // animation phase counter
+static uint32_t  s_strip_last_tick_ms = 0;
+static const uint16_t STRIP_TICK_INTERVAL_MS = 30;      // ~33 FPS
 
 static const char* expressionName(Expression e) {
   switch (e) {
@@ -340,6 +357,145 @@ static void handlePlay() {
   sendJson(ok ? 200 : 500, res);
 }
 
+// ---- WS2812 strip helpers ------------------------------------------------
+
+static uint8_t clampBrightness(int v) {
+  if (v < 0) return 0;
+  if (v > STRIP_MAX_BRIGHTNESS) return STRIP_MAX_BRIGHTNESS;
+  return (uint8_t)v;
+}
+
+static bool parseRgb(JsonDocument& body, uint8_t* r, uint8_t* g, uint8_t* b) {
+  if (!body["r"].is<int>() || !body["g"].is<int>() || !body["b"].is<int>()) return false;
+  int rr = body["r"]; int gg = body["g"]; int bb = body["b"];
+  if (rr < 0 || rr > 255 || gg < 0 || gg > 255 || bb < 0 || bb > 255) return false;
+  *r = (uint8_t)rr; *g = (uint8_t)gg; *b = (uint8_t)bb;
+  return true;
+}
+
+// Adafruit_NeoPixel ColorHSV returns gamma-uncorrected; ColorHSV + gamma32
+// gives perceptually-even rainbows. Hue is 0..65535.
+static uint32_t hsv(uint16_t hue, uint8_t sat = 255, uint8_t val = 255) {
+  return Adafruit_NeoPixel::gamma32(Adafruit_NeoPixel::ColorHSV(hue, sat, val));
+}
+
+// Step the active effect. Called from loop(); cheap when nothing to do.
+static void stripTick() {
+  if (s_strip_mode == STRIP_MODE_STATIC) return;
+  uint32_t now = millis();
+  if (now - s_strip_last_tick_ms < STRIP_TICK_INTERVAL_MS) return;
+  s_strip_last_tick_ms = now;
+  s_strip_phase++;
+
+  switch (s_strip_mode) {
+    case STRIP_MODE_RAINBOW: {
+      // Full hue rotation across the strip, slowly drifting.
+      uint16_t base = s_strip_phase * 256;   // ~7.6s per full rotation
+      for (uint16_t i = 0; i < STRIP_COUNT; ++i) {
+        uint16_t hue = base + (uint16_t)((uint32_t)i * 65536 / STRIP_COUNT);
+        strip.setPixelColor(i, hsv(hue));
+      }
+      strip.show();
+      break;
+    }
+    case STRIP_MODE_BREATHE: {
+      // Triangle wave 0..255..0 over ~3s, scaled to brightness cap.
+      uint16_t p = s_strip_phase % 200;
+      uint8_t lvl = (p < 100) ? (p * 255 / 100) : ((200 - p) * 255 / 100);
+      uint8_t r = ((s_strip_base_color >> 16) & 0xFF) * lvl / 255;
+      uint8_t g = ((s_strip_base_color >>  8) & 0xFF) * lvl / 255;
+      uint8_t b = ((s_strip_base_color      ) & 0xFF) * lvl / 255;
+      strip.fill(strip.Color(r, g, b));
+      strip.show();
+      break;
+    }
+    case STRIP_MODE_CHASE: {
+      // One pixel of base_color travels around; everything else dark.
+      uint16_t head = s_strip_phase % STRIP_COUNT;
+      strip.clear();
+      strip.setPixelColor(head, s_strip_base_color);
+      strip.show();
+      break;
+    }
+    default: break;
+  }
+}
+
+// POST /leds  body: {r,g,b,brightness?}    -> solid color on all pixels
+static void handleLeds() {
+  JsonDocument body;
+  if (!readJsonBody(body)) { sendErr(400, "invalid json body"); return; }
+  uint8_t r, g, b;
+  if (!parseRgb(body, &r, &g, &b)) { sendErr(400, "need r,g,b (0..255)"); return; }
+  uint8_t bright = clampBrightness(body["brightness"] | (int)STRIP_MAX_BRIGHTNESS);
+
+  s_strip_mode = STRIP_MODE_STATIC;
+  strip.setBrightness(bright);
+  strip.fill(strip.Color(r, g, b));
+  strip.show();
+
+  JsonDocument res;
+  res["ok"] = true;
+  res["mode"] = "solid";
+  res["brightness"] = bright;
+  sendJson(200, res);
+}
+
+// POST /leds/pixel  body: {index,r,g,b}    -> set one pixel (STATIC mode)
+static void handleLedsPixel() {
+  JsonDocument body;
+  if (!readJsonBody(body)) { sendErr(400, "invalid json body"); return; }
+  if (!body["index"].is<int>()) { sendErr(400, "need index"); return; }
+  int idx = body["index"];
+  if (idx < 0 || idx >= STRIP_COUNT) { sendErr(400, "index 0..29"); return; }
+  uint8_t r, g, b;
+  if (!parseRgb(body, &r, &g, &b)) { sendErr(400, "need r,g,b (0..255)"); return; }
+
+  s_strip_mode = STRIP_MODE_STATIC;
+  strip.setPixelColor((uint16_t)idx, strip.Color(r, g, b));
+  strip.show();
+
+  JsonDocument res; res["ok"] = true; res["index"] = idx; sendJson(200, res);
+}
+
+// POST /leds/effect  body: {name:"rainbow|breathe|chase|off", r?,g?,b?, brightness?}
+// rainbow ignores r,g,b. breathe/chase use them as the base color (default red).
+static void handleLedsEffect() {
+  JsonDocument body;
+  if (!readJsonBody(body)) { sendErr(400, "invalid json body"); return; }
+  String name = body["name"] | "";
+  if (name.isEmpty()) { sendErr(400, "need name"); return; }
+
+  uint8_t bright = clampBrightness(body["brightness"] | (int)STRIP_MAX_BRIGHTNESS);
+  strip.setBrightness(bright);
+
+  // Optional base color for breathe/chase. Defaults to red so it's never invisible.
+  uint8_t r = body["r"] | 255;
+  uint8_t g = body["g"] | 0;
+  uint8_t b = body["b"] | 0;
+  s_strip_base_color = strip.Color(r, g, b);
+  s_strip_phase = 0;
+  s_strip_last_tick_ms = 0;
+
+  if (name == "rainbow")       s_strip_mode = STRIP_MODE_RAINBOW;
+  else if (name == "breathe")  s_strip_mode = STRIP_MODE_BREATHE;
+  else if (name == "chase")    s_strip_mode = STRIP_MODE_CHASE;
+  else if (name == "off") {
+    s_strip_mode = STRIP_MODE_STATIC;
+    strip.clear();
+    strip.show();
+  } else {
+    sendErr(400, "name must be rainbow|breathe|chase|off");
+    return;
+  }
+
+  JsonDocument res;
+  res["ok"] = true;
+  res["mode"] = name;
+  res["brightness"] = bright;
+  sendJson(200, res);
+}
+
 static void handleNotFound() {
   sendErr(404, "no such route");
 }
@@ -534,6 +690,12 @@ void setup() {
   Serial.begin(115200);
   M5StackChan.begin();
 
+  // WS2812 strip on Port C — start dark at the safe brightness cap.
+  strip.begin();
+  strip.setBrightness(STRIP_MAX_BRIGHTNESS);
+  strip.clear();
+  strip.show();
+
   connectWifi();
   delay(1500);
 
@@ -553,6 +715,9 @@ void setup() {
   server.on("/servo/home",  HTTP_POST, handleHome);
   server.on("/servo/stop",  HTTP_POST, handleStopServo);
   server.on("/led",         HTTP_POST, handleLed);
+  server.on("/leds",        HTTP_POST, handleLeds);
+  server.on("/leds/pixel",  HTTP_POST, handleLedsPixel);
+  server.on("/leds/effect", HTTP_POST, handleLedsEffect);
   server.on("/play",        HTTP_POST, handlePlay);
   server.on("/reset",       HTTP_POST, handleReset);
   server.onNotFound(handleNotFound);
@@ -580,6 +745,7 @@ void loop() {
   M5StackChan.update();
   server.handleClient();
   ArduinoOTA.handle();
+  stripTick();
 
   // Deferred soft-reset (set by /reset handler).
   if (s_reset_at_ms != 0 && (int32_t)(millis() - s_reset_at_ms) >= 0) {
