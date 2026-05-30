@@ -64,6 +64,13 @@ static camera_config_t s_camera_config = {
 static volatile uint32_t s_speech_clear_at_ms = 0;
 static volatile bool     s_speaking = false;
 
+// /play state. M5.Speaker.playWav holds a pointer (not a copy) into the WAV
+// buffer until playback ends, so we own the buffer for the lifetime of the
+// playback. We stop() and free() on the next /play call.
+static uint8_t* s_play_buf = nullptr;
+static size_t   s_play_buf_len = 0;
+static const size_t PLAY_BUF_MAX = 4 * 1024 * 1024;   // 4 MB hard cap
+
 static const char* expressionName(Expression e) {
   switch (e) {
     case Expression::Happy:   return "happy";
@@ -245,6 +252,92 @@ static void handleReset() {
   JsonDocument res; res["ok"] = true; res["restarting_in_ms"] = 250;
   sendJson(200, res);
   s_reset_at_ms = millis() + 250;
+}
+
+// POST /play  body: {"url":"http://...","volume":128,"stop_current":true}
+// StackChan fetches the WAV via HTTPClient and plays it through the M5Speaker.
+// Returns 200 with {ok:true, bytes:<n>} once the audio is queued — does NOT
+// block on playback (so /servo, /face stay responsive).
+static void handlePlay() {
+  JsonDocument body;
+  if (!readJsonBody(body)) { sendErr(400, "invalid json body"); return; }
+  String url = body["url"] | "";
+  int volume = body["volume"] | 128;          // 0..255
+  bool stop_current = body["stop_current"] | true;
+
+  if (url.isEmpty()) { sendErr(400, "need url"); return; }
+  if (volume < 0) volume = 0;
+  if (volume > 255) volume = 255;
+
+  WiFiClientSecure secure;
+  secure.setInsecure();
+  HTTPClient http;
+  bool is_https = url.startsWith("https://");
+  bool begin_ok = is_https ? http.begin(secure, url) : http.begin(url);
+  if (!begin_ok) { sendErr(502, "http begin failed"); return; }
+  http.setTimeout(15000);
+  http.setConnectTimeout(5000);
+
+  int code = http.GET();
+  if (code != 200) {
+    http.end();
+    JsonDocument d; d["ok"] = false; d["error"] = "fetch failed"; d["http_code"] = code;
+    sendJson(502, d);
+    return;
+  }
+
+  int total = http.getSize();
+  if (total <= 0 || (size_t)total > PLAY_BUF_MAX) {
+    http.end();
+    JsonDocument d; d["ok"] = false; d["error"] = "bad content-length"; d["size"] = total;
+    sendJson(400, d);
+    return;
+  }
+
+  uint8_t* buf = (uint8_t*)ps_malloc((size_t)total);
+  if (!buf) { http.end(); sendErr(507, "ps_malloc failed"); return; }
+
+  WiFiClient* stream = http.getStreamPtr();
+  size_t got = 0;
+  uint32_t deadline = millis() + 20000;
+  while (got < (size_t)total && millis() < deadline) {
+    int avail = stream->available();
+    if (avail > 0) {
+      int r = stream->readBytes(buf + got, avail);
+      if (r > 0) got += r;
+    } else if (!http.connected()) {
+      break;
+    } else {
+      delay(2);
+    }
+  }
+  http.end();
+
+  if (got != (size_t)total) {
+    free(buf);
+    JsonDocument d; d["ok"] = false; d["error"] = "short read"; d["got"] = got; d["want"] = total;
+    sendJson(502, d);
+    return;
+  }
+
+  // Stop any in-flight playback (drains DMA) before freeing its buffer.
+  if (s_play_buf != nullptr) {
+    M5.Speaker.stop();
+    free(s_play_buf);
+    s_play_buf = nullptr;
+    s_play_buf_len = 0;
+  }
+  s_play_buf = buf;
+  s_play_buf_len = (size_t)total;
+
+  M5.Speaker.setVolume((uint8_t)volume);
+  bool ok = M5.Speaker.playWav(s_play_buf, s_play_buf_len, 1, -1, stop_current);
+
+  JsonDocument res;
+  res["ok"] = ok;
+  res["bytes"] = (uint32_t)s_play_buf_len;
+  res["volume"] = volume;
+  sendJson(ok ? 200 : 500, res);
 }
 
 static void handleNotFound() {
@@ -460,6 +553,7 @@ void setup() {
   server.on("/servo/home",  HTTP_POST, handleHome);
   server.on("/servo/stop",  HTTP_POST, handleStopServo);
   server.on("/led",         HTTP_POST, handleLed);
+  server.on("/play",        HTTP_POST, handlePlay);
   server.on("/reset",       HTTP_POST, handleReset);
   server.onNotFound(handleNotFound);
   server.begin();
