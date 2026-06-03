@@ -533,6 +533,75 @@ static void handleLedsBuffer() {
   sendJson(200, res);
 }
 
+// POST /state  body: {"state":"idle|busy|attention|celebrate|heart|nap", "prompt_id"?:"req_abc"}
+// Composite endpoint inspired by claude-desktop-buddy. Drives face + onboard ring
+// + Port C strip atomically so the host doesn't have to chain three calls.
+// prompt_id is accepted and echoed back so future firmware revs can route an
+// approve/deny reply by id without breaking the wire format now.
+//
+//   idle       neutral  ring off              strip off
+//   busy       neutral  ring dim blue         strip off
+//   attention  doubt    ring bright yellow    strip yellow chase
+//   celebrate  happy    ring off              strip rainbow
+//   heart      happy    ring dim red          strip off
+//   nap        sleepy   ring off              strip off
+static void handleState() {
+  JsonDocument body;
+  if (!readJsonBody(body)) { sendErr(400, "invalid json body"); return; }
+  String state = body["state"] | "";
+  if (state.isEmpty()) { sendErr(400, "need state"); return; }
+
+  Expression face;
+  uint8_t ring_r = 0, ring_g = 0, ring_b = 0;
+  StripMode strip_mode = STRIP_MODE_STATIC;
+  uint32_t strip_color = strip.Color(0, 0, 0);
+
+  if (state == "idle") {
+    face = Expression::Neutral;
+  } else if (state == "busy") {
+    face = Expression::Neutral;
+    ring_r = 0; ring_g = 40; ring_b = 80;
+  } else if (state == "attention") {
+    face = Expression::Doubt;
+    ring_r = 200; ring_g = 160; ring_b = 0;
+    strip_mode = STRIP_MODE_CHASE;
+    strip_color = strip.Color(255, 180, 0);
+  } else if (state == "celebrate") {
+    face = Expression::Happy;
+    strip_mode = STRIP_MODE_RAINBOW;
+  } else if (state == "heart") {
+    face = Expression::Happy;
+    ring_r = 120; ring_g = 0; ring_b = 20;
+  } else if (state == "nap") {
+    face = Expression::Sleepy;
+  } else {
+    sendErr(400, "state must be idle|busy|attention|celebrate|heart|nap");
+    return;
+  }
+
+  avatar.setExpression(face);
+  M5StackChan.showRgbColor(ring_r, ring_g, ring_b);
+
+  s_strip_mode = strip_mode;
+  strip.setBrightness(STRIP_MAX_BRIGHTNESS);
+  if (strip_mode == STRIP_MODE_STATIC) {
+    strip.clear();
+    strip.show();
+  } else {
+    s_strip_base_color = strip_color;
+    s_strip_phase = 0;
+    s_strip_last_tick_ms = 0;
+  }
+
+  JsonDocument res;
+  res["ok"] = true;
+  res["state"] = state;
+  if (body["prompt_id"].is<const char*>()) {
+    res["prompt_id"] = body["prompt_id"].as<String>();
+  }
+  sendJson(200, res);
+}
+
 static void handleNotFound() {
   sendErr(404, "no such route");
 }
@@ -756,6 +825,7 @@ void setup() {
   server.on("/leds/pixel",  HTTP_POST, handleLedsPixel);
   server.on("/leds/effect", HTTP_POST, handleLedsEffect);
   server.on("/leds/buffer", HTTP_POST, handleLedsBuffer);
+  server.on("/state",       HTTP_POST, handleState);
   server.on("/play",        HTTP_POST, handlePlay);
   server.on("/reset",       HTTP_POST, handleReset);
   server.onNotFound(handleNotFound);

@@ -100,5 +100,25 @@ def set_buffer(pixels: list[list[int]], brightness: int = 64) -> dict[str, Any]:
     return _request("POST", "/leds/buffer", json={"pixels": pixels, "brightness": brightness})
 
 
+@mcp.tool()
+def set_state(state: str, prompt_id: str | None = None) -> dict[str, Any]:
+    """Set the buddy state — drives face + LED ring + Port C strip atomically.
+
+    state is one of: idle, busy, attention, celebrate, heart, nap.
+    Maps loosely onto the claude-desktop-buddy behavior model:
+      idle       no work pending          neutral face, dark
+      busy       tools running            neutral face, dim blue ring
+      attention  permission prompt open   doubt face, yellow ring + chase strip
+      celebrate  token milestone hit      happy face, rainbow strip
+      heart      quick approval (<5s)     happy face, dim red ring
+      nap        idle > 30s               sleepy face, dark
+    prompt_id is echoed back; future revs will use it for approve/deny round-trip.
+    """
+    payload: dict[str, Any] = {"state": state}
+    if prompt_id is not None:
+        payload["prompt_id"] = prompt_id
+    return _request("POST", "/state", json=payload)
+
+
 if __name__ == "__main__":
     mcp.run()

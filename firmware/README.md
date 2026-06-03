@@ -15,6 +15,11 @@ Control HTTP on **`:80`** (Arduino `WebServer`):
 | `POST /servo/home` | `{"speed": 500}` | Returns head to home. |
 | `POST /servo/stop` | — | Cancels in-flight motion. |
 | `POST /led` | `{"r": 0..255, "g": 0..255, "b": 0..255, "index": 0..11}` | Omit `index` to set all 12 LEDs at once. |
+| `POST /leds` | `{"r": 0..255, "g": 0..255, "b": 0..255, "brightness": 0..64}` | Solid fill of the Port C 30-LED strip. |
+| `POST /leds/pixel` | `{"index": 0..29, "r": 0..255, "g": 0..255, "b": 0..255}` | Set one strip pixel. |
+| `POST /leds/effect` | `{"name": "rainbow"|"breathe"|"chase"|"off", "r": 0..255, "g": 0..255, "b": 0..255, "brightness": 0..64}` | Run a strip animation. |
+| `POST /leds/buffer` | `{"pixels": [[r,g,b], ...], "brightness": 0..64}` | Paint the strip in one shot; used as a progress bar. |
+| `POST /state` | `{"state": "idle"|"busy"|"attention"|"celebrate"|"heart"|"nap", "prompt_id": "..."}` | Composite buddy-style state — drives face + ring + strip atomically. See `host-hooks/`. |
 | `POST /reset` | — | Acks, then reboots ~250 ms later. |
 
 Camera HTTP on **`:81`** (ESP-IDF `httpd`, runs in its own task so streaming doesn't block control):
