@@ -101,6 +101,51 @@ def set_buffer(pixels: list[list[int]], brightness: int = 64) -> dict[str, Any]:
 
 
 @mcp.tool()
+def heartbeat(
+    total: int = 0,
+    running: int = 0,
+    waiting: int = 0,
+    tokens: int = 0,
+    tokens_today: int = 0,
+    prompt_id: str | None = None,
+    prompt_tool: str | None = None,
+    prompt_hint: str | None = None,
+) -> dict[str, Any]:
+    """Push a buddy heartbeat — the device picks the state from the payload.
+
+    Mirrors the wire shape used by anthropics/claude-desktop-buddy. If prompt_id
+    is set the device enters `attention` with a pending prompt. Otherwise the
+    state is derived from running/waiting/tokens — and crossing each 50K-token
+    boundary triggers a one-shot `celebrate`.
+    """
+    body: dict[str, Any] = {
+        "total": total,
+        "running": running,
+        "waiting": waiting,
+        "tokens": tokens,
+        "tokens_today": tokens_today,
+    }
+    if prompt_id is not None:
+        body["prompt"] = {"id": prompt_id}
+        if prompt_tool is not None:
+            body["prompt"]["tool"] = prompt_tool
+        if prompt_hint is not None:
+            body["prompt"]["hint"] = prompt_hint
+    return _request("POST", "/heartbeat", json=body)
+
+
+@mcp.tool()
+def get_pending() -> dict[str, Any]:
+    """Short-poll the device for a pending permission decision.
+
+    Response: {pending: bool, prompt_id: str, decision: "once"|"deny"|""}.
+    Reading a populated decision clears it on the device side; the next poll
+    will return pending=false.
+    """
+    return _request("GET", "/pending")
+
+
+@mcp.tool()
 def set_state(state: str, prompt_id: str | None = None) -> dict[str, Any]:
     """Set the buddy state — drives face + LED ring + Port C strip atomically.
 

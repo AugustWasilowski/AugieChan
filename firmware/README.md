@@ -19,8 +19,12 @@ Control HTTP on **`:80`** (Arduino `WebServer`):
 | `POST /leds/pixel` | `{"index": 0..29, "r": 0..255, "g": 0..255, "b": 0..255}` | Set one strip pixel. |
 | `POST /leds/effect` | `{"name": "rainbow"|"breathe"|"chase"|"off", "r": 0..255, "g": 0..255, "b": 0..255, "brightness": 0..64}` | Run a strip animation. |
 | `POST /leds/buffer` | `{"pixels": [[r,g,b], ...], "brightness": 0..64}` | Paint the strip in one shot; used as a progress bar. |
-| `POST /state` | `{"state": "idle"|"busy"|"attention"|"celebrate"|"heart"|"nap", "prompt_id": "..."}` | Composite buddy-style state — drives face + ring + strip atomically. See `host-hooks/`. |
+| `POST /state` | `{"state": "idle"|"busy"|"attention"|"celebrate"|"heart"|"dizzy"|"nap", "prompt_id": "..."}` | Composite buddy-style state — drives face + ring + strip atomically. `celebrate`/`heart`/`dizzy` auto-revert after 2–3 s. See `host-hooks/`. |
+| `POST /heartbeat` | `{"total": int, "running": int, "waiting": int, "tokens": int, "tokens_today": int, "prompt": {"id", "tool", "hint"}}` | Mirrors the [claude-desktop-buddy] heartbeat shape. Firmware derives the state: `prompt` → `attention`, running/waiting → `busy`, crossing each 50K-token boundary → one-shot `celebrate`. Snapshot is echoed in `/status`. |
+| `GET /pending` | — | `{pending, prompt_id, decision}`. Short-poll for permission-prompt resolution. A populated decision is consumed (cleared device-side) by reading it. |
 | `POST /reset` | — | Acks, then reboots ~250 ms later. |
+
+[claude-desktop-buddy]: https://github.com/anthropics/claude-desktop-buddy
 
 Camera HTTP on **`:81`** (ESP-IDF `httpd`, runs in its own task so streaming doesn't block control):
 
@@ -34,6 +38,20 @@ The split-port design is deliberate — Arduino `WebServer` is single-threaded, 
 ## Outbound events
 
 When the faceplate's touch sensor reports `wasClicked()` / swipe forward / swipe back, the firmware POSTs a JSON event to `N8N_EVENT_URL` (configured in `secrets.h`). Useful for hooking the robot into automations on your own n8n / Home Assistant / etc.
+
+**Permission flow exception**: while a buddy permission prompt is pending (set via `POST /state {"state":"attention","prompt_id":...}` or via `POST /heartbeat` with a `prompt` field), faceplate swipes are consumed locally instead of forwarding:
+
+| Gesture | Effect |
+| --- | --- |
+| Swipe forward | Resolves `decision: "once"` on the pending prompt, plays a quick `heart` celebration. |
+| Swipe backward | Resolves `decision: "deny"` on the pending prompt. |
+| Click | Still forwarded — no resolve. |
+
+The host reads the resolution via `GET /pending`. See `host-hooks/buddy_state.py` for the polling implementation.
+
+## Shake → dizzy
+
+When `M5.Imu`'s accelerometer magnitude registers three sharp jolts (Δ ≥ 1.2 G each) inside a 700 ms window, the firmware drops into the `dizzy` state for ~2 s — doubt face + rainbow strip. Disabled while a permission prompt is pending so you can pick the buddy up to swipe without triggering false dizzies.
 
 ## Build & flash
 

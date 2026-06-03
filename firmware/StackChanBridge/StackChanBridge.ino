@@ -88,6 +88,34 @@ static uint16_t  s_strip_phase = 0;                     // animation phase count
 static uint32_t  s_strip_last_tick_ms = 0;
 static const uint16_t STRIP_TICK_INTERVAL_MS = 30;      // ~33 FPS
 
+// Buddy state machine ------------------------------------------------------
+// Tracks the current state name + any pending permission prompt. Transient
+// states (celebrate/heart/dizzy) auto-revert via s_state_revert_at_ms.
+static String   s_current_state = "idle";
+static String   s_pending_prompt_id = "";
+static String   s_pending_decision = "";   // "" | "once" | "deny"
+static uint32_t s_state_revert_at_ms = 0;  // 0 = no scheduled revert
+static String   s_state_revert_to = "busy";
+
+// Heartbeat snapshot — most recent values pushed to /heartbeat, echoed in /status.
+static int      s_hb_total = 0;
+static int      s_hb_running = 0;
+static int      s_hb_waiting = 0;
+static int64_t  s_hb_tokens = 0;
+static int64_t  s_hb_tokens_today = 0;
+static int64_t  s_hb_last_celebrated_tokens = -1;  // -1 = never celebrated
+static const int64_t HB_CELEBRATE_INTERVAL = 50000;
+
+// Shake detection (BMI270 via M5.Imu). Three sharp jolts within SHAKE_WINDOW_MS
+// while no prompt is pending → dizzy state.
+static uint32_t s_shake_jolts[3] = {0};
+static uint8_t  s_shake_jolt_idx = 0;
+static float    s_imu_last_mag = 1.0f;             // ~1G at rest
+static uint32_t s_imu_last_sample_ms = 0;
+static const uint16_t IMU_SAMPLE_INTERVAL_MS = 50;
+static const float    SHAKE_JOLT_DELTA_G = 1.2f;   // |Δmag| above this counts as a jolt
+static const uint16_t SHAKE_WINDOW_MS = 700;
+
 static const char* expressionName(Expression e) {
   switch (e) {
     case Expression::Happy:   return "happy";
@@ -146,6 +174,17 @@ static void handleStatus() {
   d["yaw"] = M5StackChan.Motion.getCurrentYawAngle();
   d["pitch"] = M5StackChan.Motion.getCurrentPitchAngle();
   d["camera"] = s_camera_ready;
+  d["state"] = s_current_state;
+  if (!s_pending_prompt_id.isEmpty()) {
+    d["pending_prompt_id"] = s_pending_prompt_id;
+    d["pending_decision"] = s_pending_decision;
+  }
+  JsonObject hb = d["heartbeat"].to<JsonObject>();
+  hb["total"] = s_hb_total;
+  hb["running"] = s_hb_running;
+  hb["waiting"] = s_hb_waiting;
+  hb["tokens"] = s_hb_tokens;
+  hb["tokens_today"] = s_hb_tokens_today;
   sendJson(200, d);
 }
 
@@ -533,28 +572,25 @@ static void handleLedsBuffer() {
   sendJson(200, res);
 }
 
-// POST /state  body: {"state":"idle|busy|attention|celebrate|heart|nap", "prompt_id"?:"req_abc"}
-// Composite endpoint inspired by claude-desktop-buddy. Drives face + onboard ring
-// + Port C strip atomically so the host doesn't have to chain three calls.
-// prompt_id is accepted and echoed back so future firmware revs can route an
-// approve/deny reply by id without breaking the wire format now.
+// Buddy state model — drives face + onboard ring + Port C strip atomically.
 //
 //   idle       neutral  ring off              strip off
 //   busy       neutral  ring dim blue         strip off
 //   attention  doubt    ring bright yellow    strip yellow chase
-//   celebrate  happy    ring off              strip rainbow
-//   heart      happy    ring dim red          strip off
+//   celebrate  happy    ring off              strip rainbow   (3 s auto-revert)
+//   heart      happy    ring dim red          strip off       (3 s auto-revert)
+//   dizzy      doubt    ring off              strip rainbow   (2 s auto-revert)
 //   nap        sleepy   ring off              strip off
-static void handleState() {
-  JsonDocument body;
-  if (!readJsonBody(body)) { sendErr(400, "invalid json body"); return; }
-  String state = body["state"] | "";
-  if (state.isEmpty()) { sendErr(400, "need state"); return; }
-
+//
+// applyState returns false if `state` is unknown — caller is responsible for the
+// HTTP 400. prompt_id is stored when state == "attention" so a touch gesture in
+// loop() can resolve it; entering any other state clears the pending prompt.
+static bool applyState(const String& state, const String& prompt_id) {
   Expression face;
   uint8_t ring_r = 0, ring_g = 0, ring_b = 0;
   StripMode strip_mode = STRIP_MODE_STATIC;
   uint32_t strip_color = strip.Color(0, 0, 0);
+  uint32_t revert_after_ms = 0;   // 0 = no auto-revert
 
   if (state == "idle") {
     face = Expression::Neutral;
@@ -569,14 +605,19 @@ static void handleState() {
   } else if (state == "celebrate") {
     face = Expression::Happy;
     strip_mode = STRIP_MODE_RAINBOW;
+    revert_after_ms = 3000;
   } else if (state == "heart") {
     face = Expression::Happy;
     ring_r = 120; ring_g = 0; ring_b = 20;
+    revert_after_ms = 3000;
+  } else if (state == "dizzy") {
+    face = Expression::Doubt;
+    strip_mode = STRIP_MODE_RAINBOW;
+    revert_after_ms = 2000;
   } else if (state == "nap") {
     face = Expression::Sleepy;
   } else {
-    sendErr(400, "state must be idle|busy|attention|celebrate|heart|nap");
-    return;
+    return false;
   }
 
   avatar.setExpression(face);
@@ -593,13 +634,126 @@ static void handleState() {
     s_strip_last_tick_ms = 0;
   }
 
+  s_current_state = state;
+  if (state == "attention") {
+    s_pending_prompt_id = prompt_id;
+    s_pending_decision = "";
+  } else {
+    s_pending_prompt_id = "";
+    s_pending_decision = "";
+  }
+
+  if (revert_after_ms > 0) {
+    s_state_revert_at_ms = millis() + revert_after_ms;
+    // Don't overwrite the revert target if we're chaining transients.
+    if (s_state_revert_to.isEmpty() ||
+        s_state_revert_to == "celebrate" || s_state_revert_to == "heart" ||
+        s_state_revert_to == "dizzy") {
+      s_state_revert_to = "busy";
+    }
+  } else {
+    s_state_revert_at_ms = 0;
+    s_state_revert_to = state;
+  }
+  return true;
+}
+
+// POST /state  body: {"state":"idle|busy|attention|celebrate|heart|dizzy|nap",
+//                     "prompt_id"?:"req_abc"}
+// Thin wrapper over applyState() so it can be driven from the host directly
+// without going through /heartbeat. See applyState() above for the state-to-
+// face/LED mapping table.
+static void handleState() {
+  JsonDocument body;
+  if (!readJsonBody(body)) { sendErr(400, "invalid json body"); return; }
+  String state = body["state"] | "";
+  if (state.isEmpty()) { sendErr(400, "need state"); return; }
+  String prompt_id = body["prompt_id"] | "";
+
+  if (!applyState(state, prompt_id)) {
+    sendErr(400, "state must be idle|busy|attention|celebrate|heart|dizzy|nap");
+    return;
+  }
+
   JsonDocument res;
   res["ok"] = true;
   res["state"] = state;
-  if (body["prompt_id"].is<const char*>()) {
-    res["prompt_id"] = body["prompt_id"].as<String>();
-  }
+  if (!prompt_id.isEmpty()) res["prompt_id"] = prompt_id;
   sendJson(200, res);
+}
+
+// Map a buddy-style heartbeat payload onto a state name. Order matters —
+// "prompt present" wins over "running", which wins over "waiting".
+static String deriveStateFromHeartbeat(int running, int waiting,
+                                       bool has_prompt, int64_t tokens) {
+  if (has_prompt) return "attention";
+  // Token milestone: every 50K tokens we celebrate once.
+  if (s_hb_last_celebrated_tokens < 0) {
+    s_hb_last_celebrated_tokens = tokens;
+  } else if (tokens - s_hb_last_celebrated_tokens >= HB_CELEBRATE_INTERVAL) {
+    s_hb_last_celebrated_tokens = tokens;
+    return "celebrate";
+  }
+  if (running > 0 || waiting > 0) return "busy";
+  return "idle";
+}
+
+// POST /heartbeat — mirrors the wire shape used by anthropics/claude-desktop-buddy.
+// Body fields (all optional): total, running, waiting, msg, entries[],
+//                             tokens, tokens_today, prompt{id,tool,hint}
+// Derives a buddy state and applies it. The full snapshot is stashed so /status
+// can echo it back. msg and entries are accepted but not yet displayed
+// (the screen is owned by the avatar; ticker overlay is future work).
+static void handleHeartbeat() {
+  JsonDocument body;
+  if (!readJsonBody(body)) { sendErr(400, "invalid json body"); return; }
+
+  s_hb_total        = body["total"]        | 0;
+  s_hb_running      = body["running"]      | 0;
+  s_hb_waiting      = body["waiting"]      | 0;
+  s_hb_tokens       = body["tokens"]       | (int64_t)0;
+  s_hb_tokens_today = body["tokens_today"] | (int64_t)0;
+
+  bool has_prompt = body["prompt"].is<JsonObject>() &&
+                    body["prompt"]["id"].is<const char*>();
+  String prompt_id = has_prompt ? body["prompt"]["id"].as<String>() : String();
+
+  String state = deriveStateFromHeartbeat(s_hb_running, s_hb_waiting,
+                                          has_prompt, s_hb_tokens);
+  applyState(state, prompt_id);
+
+  JsonDocument res;
+  res["ok"] = true;
+  res["state"] = state;
+  if (!prompt_id.isEmpty()) res["prompt_id"] = prompt_id;
+  res["tokens"] = s_hb_tokens;
+  sendJson(200, res);
+}
+
+// GET /pending — short-poll endpoint for the host. Reports whether a
+// permission prompt is currently displayed on the buddy and, once the user
+// taps approve/deny, returns the decision and clears it.
+//
+// Response shape:
+//   {pending: bool, prompt_id: "req_abc", decision: "once"|"deny"|""}
+// Semantics:
+//   pending=false, decision="" → nothing to show
+//   pending=true,  decision="" → still waiting for the user
+//   pending=true,  decision=X  → user decided X; the firmware clears the
+//                                pending prompt as soon as you read it
+static void handlePending() {
+  JsonDocument res;
+  bool pending = !s_pending_prompt_id.isEmpty();
+  res["pending"] = pending;
+  res["prompt_id"] = s_pending_prompt_id;
+  res["decision"] = s_pending_decision;
+  sendJson(200, res);
+  // Consume the decision once we've handed it back so the next poll is clean.
+  if (pending && !s_pending_decision.isEmpty()) {
+    s_pending_prompt_id = "";
+    s_pending_decision = "";
+    applyState("busy", "");
+  }
 }
 
 static void handleNotFound() {
@@ -826,6 +980,8 @@ void setup() {
   server.on("/leds/effect", HTTP_POST, handleLedsEffect);
   server.on("/leds/buffer", HTTP_POST, handleLedsBuffer);
   server.on("/state",       HTTP_POST, handleState);
+  server.on("/heartbeat",   HTTP_POST, handleHeartbeat);
+  server.on("/pending",     HTTP_GET,  handlePending);
   server.on("/play",        HTTP_POST, handlePlay);
   server.on("/reset",       HTTP_POST, handleReset);
   server.onNotFound(handleNotFound);
@@ -869,8 +1025,11 @@ void loop() {
     s_speaking = false;
   }
 
-  // touch sensor → n8n
+  // Touch faceplate: when a permission prompt is pending, swipe forward =
+  // approve, swipe backward = deny — consumed locally, not forwarded to n8n.
+  // Clicks and any gestures outside the pending window flow to n8n like before.
   auto& ts = M5StackChan.TouchSensor;
+  bool pending = !s_pending_prompt_id.isEmpty() && s_pending_decision.isEmpty();
   if (ts.wasClicked()) {
     JsonDocument extra;
     auto& intens = ts.getIntensities();
@@ -879,12 +1038,58 @@ void loop() {
     postEvent("touch_click", extra);
   }
   if (ts.wasSwipedForward()) {
-    JsonDocument extra;
-    postEvent("touch_swipe_forward", extra);
+    if (pending) {
+      s_pending_decision = "once";
+      applyState("heart", s_pending_prompt_id);   // quick-approve celebration
+    } else {
+      JsonDocument extra;
+      postEvent("touch_swipe_forward", extra);
+    }
   }
   if (ts.wasSwipedBackward()) {
-    JsonDocument extra;
-    postEvent("touch_swipe_backward", extra);
+    if (pending) {
+      s_pending_decision = "deny";
+      applyState("busy", "");
+    } else {
+      JsonDocument extra;
+      postEvent("touch_swipe_backward", extra);
+    }
+  }
+
+  // Auto-revert transient states (celebrate/heart/dizzy) after their hold.
+  if (s_state_revert_at_ms != 0 && (int32_t)(millis() - s_state_revert_at_ms) >= 0) {
+    s_state_revert_at_ms = 0;
+    applyState(s_state_revert_to.isEmpty() ? String("busy") : s_state_revert_to, "");
+  }
+
+  // IMU shake → dizzy. Sample at 20 Hz; track three sharp jolts within a
+  // ~700 ms window. Skip detection while a permission prompt is pending so the
+  // user can pick up / wave the device without triggering false dizzies.
+  if ((int32_t)(millis() - s_imu_last_sample_ms) >= IMU_SAMPLE_INTERVAL_MS) {
+    s_imu_last_sample_ms = millis();
+    float ax = 0, ay = 0, az = 0;
+    if (M5.Imu.getAccel(&ax, &ay, &az)) {
+      float mag = sqrtf(ax*ax + ay*ay + az*az);
+      float delta = fabsf(mag - s_imu_last_mag);
+      s_imu_last_mag = mag;
+      if (delta >= SHAKE_JOLT_DELTA_G && s_pending_prompt_id.isEmpty()) {
+        s_shake_jolts[s_shake_jolt_idx] = millis();
+        s_shake_jolt_idx = (s_shake_jolt_idx + 1) % 3;
+        // All three slots populated AND oldest is within window → shake.
+        uint32_t now = millis();
+        bool all_recent = true;
+        for (int i = 0; i < 3; i++) {
+          if (s_shake_jolts[i] == 0 || (now - s_shake_jolts[i]) > SHAKE_WINDOW_MS) {
+            all_recent = false;
+            break;
+          }
+        }
+        if (all_recent && s_current_state != "dizzy") {
+          for (int i = 0; i < 3; i++) s_shake_jolts[i] = 0;
+          applyState("dizzy", "");
+        }
+      }
+    }
   }
 
   delay(10);
