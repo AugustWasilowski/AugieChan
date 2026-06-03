@@ -496,6 +496,43 @@ static void handleLedsEffect() {
   sendJson(200, res);
 }
 
+// POST /leds/buffer  body: {pixels: [[r,g,b], ...], brightness?}
+// Paint first N pixels (N = pixels.size(), capped at STRIP_COUNT), clear the rest.
+// Sets STATIC mode. Designed for one-shot progress-bar updates from the host.
+static void handleLedsBuffer() {
+  JsonDocument body;
+  if (!readJsonBody(body)) { sendErr(400, "invalid json body"); return; }
+  if (!body["pixels"].is<JsonArray>()) { sendErr(400, "need pixels array"); return; }
+  JsonArray arr = body["pixels"].as<JsonArray>();
+  uint8_t bright = clampBrightness(body["brightness"] | (int)STRIP_MAX_BRIGHTNESS);
+
+  s_strip_mode = STRIP_MODE_STATIC;
+  strip.setBrightness(bright);
+  strip.clear();
+
+  uint16_t n = 0;
+  for (JsonVariant px : arr) {
+    if (n >= STRIP_COUNT) break;
+    if (!px.is<JsonArray>()) { sendErr(400, "each pixel must be [r,g,b]"); return; }
+    JsonArray rgb = px.as<JsonArray>();
+    if (rgb.size() < 3) { sendErr(400, "each pixel must be [r,g,b]"); return; }
+    int rr = rgb[0] | 0, gg = rgb[1] | 0, bb = rgb[2] | 0;
+    if (rr < 0) rr = 0; if (rr > 255) rr = 255;
+    if (gg < 0) gg = 0; if (gg > 255) gg = 255;
+    if (bb < 0) bb = 0; if (bb > 255) bb = 255;
+    strip.setPixelColor(n, strip.Color((uint8_t)rr, (uint8_t)gg, (uint8_t)bb));
+    n++;
+  }
+  strip.show();
+
+  JsonDocument res;
+  res["ok"] = true;
+  res["mode"] = "buffer";
+  res["painted"] = n;
+  res["brightness"] = bright;
+  sendJson(200, res);
+}
+
 static void handleNotFound() {
   sendErr(404, "no such route");
 }
@@ -718,6 +755,7 @@ void setup() {
   server.on("/leds",        HTTP_POST, handleLeds);
   server.on("/leds/pixel",  HTTP_POST, handleLedsPixel);
   server.on("/leds/effect", HTTP_POST, handleLedsEffect);
+  server.on("/leds/buffer", HTTP_POST, handleLedsBuffer);
   server.on("/play",        HTTP_POST, handlePlay);
   server.on("/reset",       HTTP_POST, handleReset);
   server.onNotFound(handleNotFound);

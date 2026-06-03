@@ -89,5 +89,16 @@ def set_led(r: int = 0, g: int = 0, b: int = 0) -> dict[str, Any]:
     return _request("POST", "/led", json={"r": r, "g": g, "b": b})
 
 
+@mcp.tool()
+def set_buffer(pixels: list[list[int]], brightness: int = 64) -> dict[str, Any]:
+    """Paint the 30-LED Port C strip in one shot.
+
+    pixels is a list of [r, g, b] triplets; first N (max 30) LEDs are set, the rest cleared.
+    brightness is 0..64 (hard-capped in firmware because Port C 5V can't deliver full-current).
+    Empty pixels=[] clears the strip. Used as a progress bar by the macu-render pipeline.
+    """
+    return _request("POST", "/leds/buffer", json={"pixels": pixels, "brightness": brightness})
+
+
 if __name__ == "__main__":
     mcp.run()
